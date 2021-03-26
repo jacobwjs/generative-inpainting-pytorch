@@ -15,16 +15,22 @@ from data.dataset import Dataset
 from utils.tools import get_config, random_bbox, mask_image
 from utils.logger import get_logger
 
+from tqdm.auto import tqdm
+from datetime import datetime
+
+
 parser = ArgumentParser()
 parser.add_argument('--config', type=str, default='configs/config.yaml',
                     help="training configuration")
 parser.add_argument('--seed', type=int, help='manual seed')
+parser.add_argument('--load_ckpt', type=str, default=None)
 
 
 def main():
     args = parser.parse_args()
     config = get_config(args.config)
 
+    
     # CUDA configuration
     cuda = config['cuda']
     device_ids = config['gpu_ids']
@@ -34,17 +40,29 @@ def main():
         config['gpu_ids'] = device_ids
         cudnn.benchmark = True
 
+        
+    # datetime object containing current date and time
+    #
+    now = datetime.now()
+    dt_string = now.strftime("%d-%m-%Y_%H.%M.%S") 
+    
+    
     # Configure checkpoint path
-    checkpoint_path = os.path.join('checkpoints',
-                                   config['dataset_name'],
+    checkpoint_path = os.path.join('ckpts',
+                                   config['dataset_name'] + '_' + dt_string,
                                    config['mask_type'] + '_' + config['expname'])
+    
+    
     if not os.path.exists(checkpoint_path):
-        os.makedirs(checkpoint_path)
+        os.makedirs(checkpoint_path, exist_ok=True)
+        
+        
     shutil.copy(args.config, os.path.join(checkpoint_path, os.path.basename(args.config)))
     writer = SummaryWriter(logdir=checkpoint_path)
     logger = get_logger(checkpoint_path)    # get logger and configure it at the first call
-
     logger.info("Arguments: {}".format(args))
+    
+    
     # Set random seed
     if args.seed is None:
         args.seed = random.randint(1, 10000)
@@ -54,9 +72,11 @@ def main():
     if cuda:
         torch.cuda.manual_seed_all(args.seed)
 
+        
     # Log the configuration
     logger.info("Configuration: {}".format(config))
 
+    
     try:  # for unexpected error logging
         # Load the dataset
         logger.info("Training on dataset: {}".format(config['dataset_name']))
@@ -83,20 +103,27 @@ def main():
         logger.info("\n{}".format(trainer.localD))
         logger.info("\n{}".format(trainer.globalD))
 
+        
         if cuda:
             trainer = nn.parallel.DataParallel(trainer, device_ids=device_ids)
             trainer_module = trainer.module
         else:
             trainer_module = trainer
 
+            
         # Get the resume iteration to restart training
+        #
         start_iteration = trainer_module.resume(config['resume']) if config['resume'] else 1
+        print("\n\nStarting epoch: ", start_iteration)
 
         iterable_train_loader = iter(train_loader)
 
         time_count = time.time()
 
-        for iteration in range(start_iteration, config['niter'] + 1):
+        epochs = config['niter'] + 1
+        pbar = tqdm(range(start_iteration, epochs), dynamic_ncols=True, smoothing=0.01)
+#         for iteration in range(start_iteration, epochs):
+        for iteration in pbar:
             try:
                 ground_truth = next(iterable_train_loader)
             except StopIteration:
@@ -123,8 +150,8 @@ def main():
             # Update D
             trainer_module.optimizer_d.zero_grad()
             losses['d'] = losses['wgan_d'] + losses['wgan_gp'] * config['wgan_gp_lambda']
-            losses['d'].backward()
-            trainer_module.optimizer_d.step()
+#             losses['d'].backward()
+#             trainer_module.optimizer_d.step()
 
             # Update G
             if compute_g_loss:
@@ -135,6 +162,31 @@ def main():
                 losses['g'].backward()
                 trainer_module.optimizer_g.step()
 
+                
+            ### TODO:
+            ### - Why does this need to be moved from above to here?
+            ###
+            losses['d'].backward()
+            trainer_module.optimizer_d.step()    
+            
+            
+            # Set tqdm description
+            #
+            log_losses = ['l1', 'ae', 'wgan_g', 'wgan_d', 'wgan_gp', 'g', 'd']  
+#             message = 'Iter: [%d/%d] ' % (iteration, config['niter'])
+            message = ' '
+            for k in log_losses:
+                v = losses.get(k, 0.)
+                writer.add_scalar(k, v, iteration)
+                message += '%s: %.4f ' % (k, v)
+                
+            pbar.set_description(
+                (
+                    f" {message}"
+                )
+            )
+                
+                
             # Log and visualization
             log_losses = ['l1', 'ae', 'wgan_g', 'wgan_d', 'wgan_gp', 'g', 'd']
             if iteration % config['print_iter'] == 0:
@@ -149,7 +201,8 @@ def main():
                     writer.add_scalar(k, v, iteration)
                     message += '%s: %.6f ' % (k, v)
                 message += speed_msg
-                logger.info(message)
+#                 logger.info(message)
+                
 
             if iteration % (config['viz_iter']) == 0:
                 viz_max_out = config['viz_max_out']
@@ -164,10 +217,12 @@ def main():
                                   nrow=3 * 4,
                                   normalize=True)
 
+                
             # Save the model
             if iteration % config['snapshot_save_iter'] == 0:
                 trainer_module.save_model(checkpoint_path, iteration)
 
+                
     except Exception as e:  # for unexpected error logging
         logger.error("{}".format(e))
         raise e

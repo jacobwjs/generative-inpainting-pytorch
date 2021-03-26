@@ -3,9 +3,9 @@ dataset_name: flickr8k
 data_with_subfolder: False
 train_data_path: /home/ec2-user/SageMaker/dataset/flickr8k/Images
 val_data_path:
-resume:
+resume: ckpts/flickr8k_25-03-2021_10.20.00/hole_benchmark
 # batch_size: 48
-batch_size: 16
+batch_size: 8
 image_shape: [256, 256, 3]
 mask_shape: [128, 128]
 mask_batch_same: True
@@ -28,11 +28,11 @@ beta1: 0.5
 beta2: 0.9
 n_critic: 5
 # niter: 500000
-niter: 20000
+niter: 500000
 print_iter: 100
-viz_iter: 500
+viz_iter: 1000
 viz_max_out: 16
-snapshot_save_iter: 1000
+snapshot_save_iter: 10000
 
 # loss weight
 coarse_l1_alpha: 1.2
@@ -45,8 +45,8 @@ wgan_gp_lambda: 10
 # network parameters
 netG:
   input_dim: 3
-  ngf: 48
-  gated: False
+  ngf: 32
+  gated: True
 
 netD:
   input_dim: 3
