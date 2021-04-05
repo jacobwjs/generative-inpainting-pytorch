@@ -8,7 +8,13 @@ import torchvision.transforms as transforms
 
 
 class Dataset(data.Dataset):
-    def __init__(self, data_path, image_shape, with_subfolder=False, random_crop=True, return_name=False):
+    def __init__(self,
+                 data_path,
+                 image_shape,
+                 with_subfolder=False,
+                 random_crop=True,
+                 return_name=False):
+        
         super(Dataset, self).__init__()
         if with_subfolder:
             self.samples = self._find_samples_in_subfolders(data_path)

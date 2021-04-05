@@ -31,10 +31,16 @@ def tensor_img_to_npimg(tensor_img):
     assert isinstance(npimg, np.ndarray) and (npimg.ndim in {2, 3})
     return npimg
 
+def tensor_to_img(x):
+    img = tensor_img_to_npimg(x)
+    img = (img + 1) * 127.5
+    return img / 255.
+
 
 # Change the values of tensor x from range [0, 1] to [-1, 1]
 def normalize(x):
     return x.mul_(2).add_(-1)
+
 
 def same_padding(images, ksizes, strides, rates):
     assert len(images.size()) == 4
@@ -186,7 +192,7 @@ def spatial_discounting_mask(config):
             DISCOUNTED_MASK.
 
     Returns:
-        tf.Tensor: spatial discounting mask
+        Tensor: spatial discounting mask
 
     """
     gamma = config['spatial_discounting_gamma']
@@ -473,7 +479,7 @@ def deprocess(img):
 # get configs
 def get_config(config):
     with open(config, 'r') as stream:
-        return yaml.load(stream)
+        return yaml.safe_load(stream)
 
 
 # Get model list for resume

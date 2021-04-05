@@ -14,25 +14,26 @@ from utils.tools import extract_image_patches, flow_to_image, \
 class Generator(nn.Module):
     def __init__(self,
                  config,
-                 use_cuda,
-                 device_ids):
+                 use_cuda=True,
+                 device=0):
 
         super(Generator, self).__init__()
         self.input_dim = config['input_dim']
         self.cnum = config['ngf']
         self.use_cuda = use_cuda
-        self.device_ids = device_ids
         self.gated = config['gated']
+        self.device = device
 
         self.coarse_generator = CoarseGenerator(self.input_dim, self.cnum, 
                                                 gated=self.gated, 
-                                                use_cuda=self.use_cuda,
-                                                device_ids=self.device_ids)
+                                                use_cuda=use_cuda,
+                                                device=device)
 
         self.fine_generator = FineGenerator(self.input_dim, self.cnum,
                                             gated=self.gated,
-                                            use_cuda=self.use_cuda,
-                                            device_ids=self.device_ids)
+                                            use_cuda=use_cuda,
+                                            device=device)
+
 
     def forward(self, x, mask):
         x_stage1 = self.coarse_generator(x, mask)
@@ -48,12 +49,12 @@ class CoarseGenerator(nn.Module):
                  cnum,
                  gated=False,
                  use_cuda=True,
-                 device_ids=None):
+                 device=0):
         
         super(CoarseGenerator, self).__init__()
         
         self.use_cuda = use_cuda
-        self.device_ids = device_ids
+        self.device = device
 
         self.conv1 = gen_conv(input_dim + 2, cnum, 5, 1, 2, gated=gated)
         self.conv2_downsample = gen_conv(cnum, cnum*2, 3, 2, 1, gated=gated)
@@ -79,10 +80,8 @@ class CoarseGenerator(nn.Module):
         
     def forward(self, x, mask):
         # For indicating the boundaries of images
-        ones = torch.ones(x.size(0), 1, x.size(2), x.size(3))
-        if self.use_cuda:
-            ones = ones.cuda()
-            mask = mask.cuda()
+        ones = torch.ones(x.size(0), 1, x.size(2), x.size(3), device=x.device)
+#         ones = torch.ones(x.size(0), 1, x.size(2), x.size(3)).to(x.device)
             
         # 5 x 256 x 256
         x = torch.cat([x, ones, mask], dim=1)
@@ -122,12 +121,12 @@ class FineGenerator(nn.Module):
                  cnum,
                  gated=False,
                  use_cuda=True,
-                 device_ids=None):
+                 device=0):
         
         super(FineGenerator, self).__init__()
         
         self.use_cuda = use_cuda
-        self.device_ids = device_ids
+        self.device = device
 
         # 3 x 256 x 256
         self.conv1 = gen_conv(input_dim + 2, cnum, 5, 1, 2, gated=gated)
@@ -155,8 +154,10 @@ class FineGenerator(nn.Module):
         self.pmconv5 = gen_conv(cnum*4, cnum*4, 3, 1, 1, gated=gated)
         self.pmconv6 = gen_conv(cnum*4, cnum*4, 3, 1, 1, activation='relu', gated=gated)
         
-        self.contextul_attention = ContextualAttention(ksize=3, stride=1, rate=2, fuse_k=3, softmax_scale=10,
-                                                       fuse=True, use_cuda=self.use_cuda, device_ids=self.device_ids)
+        self.contextual_attention = ContextualAttention(
+            ksize=3, stride=1, rate=2, fuse_k=3, softmax_scale=10,
+            fuse=True, use_cuda=self.use_cuda, device_ids=self.device
+        )
         
         self.pmconv9 = gen_conv(cnum*4, cnum*4, 3, 1, 1, gated=gated)
         self.pmconv10 = gen_conv(cnum*4, cnum*4, 3, 1, 1, gated=gated)
@@ -171,10 +172,13 @@ class FineGenerator(nn.Module):
     def forward(self, xin, x_stage1, mask):
         x1_inpaint = x_stage1 * mask + xin * (1. - mask)
         # For indicating the boundaries of images
-        ones = torch.ones(xin.size(0), 1, xin.size(2), xin.size(3))
-        if self.use_cuda:
-            ones = ones.cuda()
-            mask = mask.cuda()
+#         ones = torch.ones(xin.size(0), 1, xin.size(2), xin.size(3)).to(x1_inpaint.device)
+        ones = torch.ones(xin.size(0), 1, xin.size(2), xin.size(3), device=x1_inpaint.device)
+
+#         if self.use_cuda:
+#             ones = ones.cuda()
+#             mask = mask.cuda()
+            
         # conv branch
         xnow = torch.cat([x1_inpaint, ones, mask], dim=1)
         x = self.conv1(xnow)
@@ -188,6 +192,7 @@ class FineGenerator(nn.Module):
         x = self.conv9_atrous(x)
         x = self.conv10_atrous(x)
         x_hallu = x
+        
         # attention branch
         x = self.pmconv1(xnow)
         x = self.pmconv2_downsample(x)
@@ -195,11 +200,12 @@ class FineGenerator(nn.Module):
         x = self.pmconv4_downsample(x)
         x = self.pmconv5(x)
         x = self.pmconv6(x)
-        x, offset_flow = self.contextul_attention(x, x, mask)
+        x, offset_flow = self.contextual_attention(x, x, mask)
         x = self.pmconv9(x)
         x = self.pmconv10(x)
         pm = x
         x = torch.cat([x_hallu, pm], dim=1)
+        
         # merge two branches
         x = self.allconv11(x)
         x = self.allconv12(x)
@@ -210,14 +216,23 @@ class FineGenerator(nn.Module):
         x = self.allconv15(x)
         x = self.allconv16(x)
         x = self.allconv17(x)
+        
         x_stage2 = torch.clamp(x, -1., 1.)
 
         return x_stage2, offset_flow
 
 
 class ContextualAttention(nn.Module):
-    def __init__(self, ksize=3, stride=1, rate=1, fuse_k=3, softmax_scale=10,
-                 fuse=False, use_cuda=False, device_ids=None):
+    def __init__(self,
+                 ksize=3,
+                 stride=1,
+                 rate=1,
+                 fuse_k=3,
+                 softmax_scale=10,
+                 fuse=False,
+                 use_cuda=False,
+                 device_ids=None):
+        
         super(ContextualAttention, self).__init__()
         self.ksize = ksize
         self.stride = stride
@@ -431,12 +446,15 @@ def test_contextual_attention(args):
 
 
 class LocalDis(nn.Module):
-    def __init__(self, config, use_cuda=True, device_ids=None):
+    def __init__(self, config,
+                 use_cuda=True,
+                 device_id=0):
+        
         super(LocalDis, self).__init__()
         self.input_dim = config['input_dim']
         self.cnum = config['ndf']
         self.use_cuda = use_cuda
-        self.device_ids = device_ids
+        self.device_id = device_id
 
         self.dis_conv_module = DisConvModule(self.input_dim, self.cnum)
         self.linear = nn.Linear(self.cnum*4*8*8, 1)
@@ -453,13 +471,13 @@ class GlobalDis(nn.Module):
     def __init__(self,
                  config,
                  use_cuda=True,
-                 device_ids=None):
+                 device_id=0):
         
         super(GlobalDis, self).__init__()
         self.input_dim = config['input_dim']
         self.cnum = config['ndf']
         self.use_cuda = use_cuda
-        self.device_ids = device_ids
+        self.device_id = device_id
         self.weight_norm = config['weight_norm']
 
         self.dis_conv_module = DisConvModule(self.input_dim, self.cnum, weight_norm=self.weight_norm)
@@ -479,11 +497,11 @@ class DisConvModule(nn.Module):
                  cnum,
                  weight_norm='none',
                  use_cuda=True,
-                 device_ids=None):
+                 device_id=0):
         
         super(DisConvModule, self).__init__()
         self.use_cuda = use_cuda
-        self.device_ids = device_ids
+        self.device_id = device_id
 
         self.conv1 = dis_conv(input_dim, cnum, 5, 2, 2, weight_norm=weight_norm)
         self.conv2 = dis_conv(cnum, cnum*2, 5, 2, 2, weight_norm=weight_norm)
