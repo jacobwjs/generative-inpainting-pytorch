@@ -15,11 +15,11 @@ from tensorboardX import SummaryWriter
 
 from trainer import Trainer, Trainer_DDP
 from data.dataset import Dataset
-from utils.tools import get_config, random_bbox, mask_image
+from utils.tools import get_config, random_bbox, mask_image, random_ff_mask
 from utils.logger import get_logger
 from utils.tools import get_model_list, local_patch, spatial_discounting_mask
 from torch import autograd
-from model.networks import Generator, LocalDis, GlobalDis
+from model.networks import Generator, LocalDis, GlobalDis, PatchDis
 
 
 from tqdm.auto import tqdm
@@ -37,6 +37,29 @@ parser.add_argument("--distributed", action='store_true')
 
 
 
+def gan_hinge_loss(pos, neg, value=1.):
+    '''
+    take from official implementation by author,
+    https://github.com/JiahuiYu/neuralgym/blob/master/neuralgym/ops/gan_ops.py
+    
+    Args:
+        pos: The real, or true outputs examples.
+        neg: The fake, or generated outputs.
+        value: boundary max.
+    
+    Returns:
+        d_loss: Discriminator loss
+        g_loss: Generator loss
+    '''
+
+    relu = nn.ReLU()
+    hinge_pos = torch.mean(relu(1 - pos))
+    hinge_neg = torch.mean(relu(1 + neg))
+    d_loss = torch.add(0.5 * hinge_pos, 0.5 * hinge_neg)
+    g_loss = -1.0 * neg.mean()
+    
+    return g_loss, d_loss
+
 
 def save_model(netG, globalD, localD, optG, optD, checkpoint_dir, iteration):
     # Save generators, discriminators, and optimizers
@@ -51,6 +74,18 @@ def save_model(netG, globalD, localD, optG, optD, checkpoint_dir, iteration):
         ckpt_name
     )
     
+    
+def save_model_v2(netG, patchD, optG, optD, checkpoint_dir, iteration):
+    # Save generators, discriminators, and optimizers
+    #
+    ckpt_name = os.path.join(checkpoint_dir, 'ckpt_%08d.pt' % iteration)
+    torch.save(
+        {'netG': netG.state_dict(),
+        'patchD': patchD.state_dict(),
+        'optG': optG.state_dict(),
+        'optD': optD.state_dict()},
+        ckpt_name
+    )
     
 def calc_gradient_penalty(netD, real_data, fake_data, local_rank):
     # Calculate gradient penalty
@@ -167,7 +202,273 @@ def forward(config, x, bboxes, masks, ground_truth,
         return losses, x2_inpaint, offset_flow
         
         
+        
+def train_distributed_v2(config, logger, writer, checkpoint_path):
+    
+    dist.init_process_group(                                   
+        backend='nccl',
+#         backend='gloo',
+        init_method='env://'
+    )  
+    
+    
+    # Find out what GPU on this compute node.
+    #
+    local_rank = torch.distributed.get_rank()
+    
+    
+    # this is the total # of GPUs across all nodes
+    # if using 2 nodes with 4 GPUs each, world size is 8
+    #
+    world_size = torch.distributed.get_world_size()
+    print("### global rank of curr node: {} of {}".format(local_rank, world_size))
+    
+    
+    # For multiprocessing distributed, DistributedDataParallel constructor
+    # should always set the single device scope, otherwise,
+    # DistributedDataParallel will use all available devices.
+    #
+    print("local_rank: ", local_rank)
+#     dist.barrier()
+    torch.cuda.set_device(local_rank)
+    print("Creating models on device: ", local_rank)
+    
+    
+    # Various definitions for models, etc.
+    #
+    input_dim = config['netG']['input_dim']
+    cnum = config['netG']['ngf']
+    use_cuda = True
+    gated = config['netG']['gated']
+    batch_size = config['batch_size']
+    
+    
+    # L1 loss used on outputs from course and fine networks in generator.
+    #
+    loss_l1 = nn.L1Loss(reduction='mean').cuda()
+    
+    # Models
+    #
+    netG = Generator(config['netG'], use_cuda=True, device=local_rank).cuda()
+    netG = torch.nn.parallel.DistributedDataParallel(
+        netG,
+        device_ids=[local_rank],
+        output_device=local_rank,
+        find_unused_parameters=True
+    )
 
+    
+    patchD = PatchDis(config['netD'], use_cuda=True, device=local_rank).cuda()
+    patchD = torch.nn.parallel.DistributedDataParallel(
+        patchD,
+        device_ids=[local_rank],
+        output_device=local_rank,
+        find_unused_parameters=True
+    )
+    
+    
+    if local_rank == 0:
+        logger.info("\n{}".format(netG))
+        logger.info("\n{}".format(patchD))
+        
+    
+    # Optimizers
+    #
+    optimizer_g = torch.optim.Adam(
+        netG.parameters(),
+        lr=config['lr'],
+        betas=(config['beta1'], config['beta2'])
+    )
+    
+    optimizer_d = torch.optim.Adam(
+        patchD.parameters(),
+        lr=config['lr'],
+        betas=(config['beta1'], config['beta2'])
+    )
+    
+    if local_rank == 0:
+        logger.info("\n{}".format(netG))
+        logger.info("\n{}".format(patchD))
+    
+    
+    # Data
+    #
+    sampler = None
+    train_dataset = Dataset(
+        data_path=config['train_data_path'],
+        with_subfolder=config['data_with_subfolder'],
+        image_shape=config['image_shape'],
+        random_crop=config['random_crop']
+    )
+        
+    
+    sampler = torch.utils.data.distributed.DistributedSampler(
+        train_dataset,
+#             num_replicas=torch.cuda.device_count(),
+        num_replicas=len(config['gpu_ids']),
+#         rank = local_rank
+    )
+    
+    
+    train_loader = torch.utils.data.DataLoader(
+        dataset=train_dataset,
+        batch_size=batch_size,
+        shuffle=(sampler is None),
+        num_workers=config['num_workers'],
+        pin_memory=True,
+        sampler=sampler,
+        drop_last=True
+    )
+    
+    
+    losses = {
+        'coarse': 0.0,
+        'fine': 0.0,
+        'ae': 0.0,
+        'g_loss': 0.0,
+        'd_loss': 0.0
+    }
+    
+    # Get the resume iteration to restart training
+    #
+    ### TODO:
+    ### - allow resuming from checkpoint.
+    ###
+#     start_iteration = trainer.resume(config['resume']) if config['resume'] else 1
+    start_iteration = 1
+    print("\n\nStarting epoch: ", start_iteration)
+
+    iterable_train_loader = iter(train_loader)
+
+    if local_rank == 0: 
+        time_count = time.time()
+
+    epochs = config['niter'] + 1
+    pbar = tqdm(range(start_iteration, epochs), dynamic_ncols=True, smoothing=0.01)
+    for iteration in pbar:
+        sampler.set_epoch(iteration)
+        
+        try:
+            ground_truth = next(iterable_train_loader)
+        except StopIteration:
+            iterable_train_loader = iter(train_loader)
+            ground_truth = next(iterable_train_loader)
+    
+        ground_truth = ground_truth.cuda(local_rank)
+        mask_ff = random_ff_mask(config['random_ff_settings'], batch_size=batch_size).cuda(local_rank)
+        
+#         netG.zero_grad()
+        imgs_incomplete = ground_truth * (1. - mask_ff) # just background
+        x1, x2, offset_flow = netG(imgs_incomplete, mask_ff)
+        imgs_complete = (x2 * mask_ff) + imgs_incomplete
+        
+        
+        # Losses 
+        #
+        coarse_loss = config['l1_loss_alpha'] * loss_l1(ground_truth, x1)
+        fine_loss = config['l1_loss_alpha'] * loss_l1(ground_truth, x2)
+        ae_loss = coarse_loss + fine_loss
+        losses['coarse'] = coarse_loss.item()
+        losses['fine'] = fine_loss.item()
+        losses['ae'] = ae_loss.item()
+        
+
+        
+        # Discriminate
+        #
+        batch_pos_neg = torch.cat([ground_truth, imgs_complete], dim=0) # [N3HW]
+        
+        # Add in mask and repeat for ground truth and generated completion.
+        # Will be split later to produce "real" and "fake" patch features in discriminator
+        # for use with hinge loss.
+        #
+        batch_pos_neg= torch.cat([batch_pos_neg, mask_ff.repeat(2, 1, 1, 1)], dim=1) # [N4HW]
+#         patchD.zero_grad()
+        pos_neg = patchD(batch_pos_neg)
+        
+        
+        # Losses
+        #
+        pos, neg = torch.chunk(pos_neg, 2, dim=0)
+        g_loss, d_loss = gan_hinge_loss(pos, neg)
+        g_loss += ae_loss
+        losses['g_loss'] = g_loss.item()
+        losses['d_loss'] = d_loss.item()
+        
+        
+        compute_g_loss = iteration % config['n_critic'] == 0
+#         # Optimize
+#         #
+#         if not compute_g_loss:
+        optimizer_d.zero_grad()
+        d_loss.backward(retain_graph=True)
+        optimizer_d.step()
+        
+        
+        pos_neg = patchD(batch_pos_neg)
+        pos, neg = torch.chunk(pos_neg, 2, dim=0)
+        g_loss, d_loss = gan_hinge_loss(pos, neg)
+        g_loss += ae_loss
+
+#         if compute_g_loss:
+        optimizer_g.zero_grad()
+        g_loss.backward()
+        optimizer_g.step()
+        
+
+#         print("ae_loss: ", ae_loss, " g_loss: ", g_loss, " d_loss: ", d_loss)
+        # Set tqdm description
+        #
+        if local_rank == 0:
+            message = ' '
+            for k in losses:
+#                 v = losses.get(k, 0.)
+                v = losses[k]
+#                 writer.add_scalar(k, v, iteration)
+                message += '%s: %.4f ' % (k, v)
+
+            pbar.set_description(
+                (
+                    f" {message}"
+                )
+            )
+        
+        # Save output from current iteration.
+        #
+        if local_rank == 0:      
+            if iteration % (config['viz_iter']) == 0:
+                    viz_max_out = config['viz_max_out']
+                    if ground_truth.size(0) > viz_max_out:
+                        viz_images = torch.stack(
+                            [ground_truth[:viz_max_out],
+                             imgs_incomplete[:viz_max_out],
+                             imgs_complete[:viz_max_out],
+                             offset_flow[:viz_max_out]],
+                             dim=1
+                        )
+                    else:
+                        viz_images = torch.stack(
+                            [ground_truth,
+                             imgs_incomplete,
+                             imgs_complete,
+                             offset_flow],
+                             dim=1
+                        )
+                    viz_images = viz_images.view(-1, *list(ground_truth.size())[1:])
+                    vutils.save_image(viz_images,
+                                      '%s/niter_%08d.png' % (checkpoint_path, iteration),
+                                      nrow=2 * 4,
+                                      normalize=True)
+        
+            # Save the model
+            if iteration % config['snapshot_save_iter'] == 0:
+                save_model_v2(netG, patchD, optimizer_g, optimizer_d, checkpoint_path, iteration)
+        
+        
+        
+        
+        
+        
 def train_distributed(config, logger, writer, checkpoint_path):
     
     dist.init_process_group(                                   
@@ -388,7 +689,7 @@ def train_distributed(config, logger, writer, checkpoint_path):
                         viz_images = torch.stack([x, inpainted_result, offset_flow], dim=1)
                     viz_images = viz_images.view(-1, *list(x.size())[1:])
                     vutils.save_image(viz_images,
-                                      '%s/niter_%03d.png' % (checkpoint_path, iteration),
+                                      '%s/niter_%08d.png' % (checkpoint_path, iteration),
                                       nrow=3 * 4,
                                       normalize=True)
 
@@ -569,7 +870,7 @@ def main():
     cuda = config['cuda']
     device_ids = config['gpu_ids']
     if cuda:
-        os.environ['CUDA_VISIBLE_DEVICES'] = ','.join(str(i) for i in device_ids)
+#         os.environ['CUDA_VISIBLE_DEVICES'] = ','.join(str(i) for i in device_ids)
         device_ids = list(range(len(device_ids)))
         config['gpu_ids'] = device_ids
         cudnn.benchmark = True
@@ -614,7 +915,8 @@ def main():
     
     if args.distributed:
         print("Distributed training...")
-        train_distributed(config, logger, writer, checkpoint_path)
+#         train_distributed(config, logger, writer, checkpoint_path)
+        train_distributed_v2(config, logger, writer, checkpoint_path)
         
     else:
         train(config, logger, checkpoint_path)
@@ -634,4 +936,7 @@ if __name__ == '__main__':
 # CUDA_VISIBLE_DEVICES=0 python -m torch.distributed.launch --nproc_per_node=1 --nnodes=1 train.py --config=configs/config-gated-spectnorm.yaml --distributed
 #
 # Distributed 1 Node, 4 GPU:
-# CUDA_VISIBLE_DEVICES=0,1,2,3 python -m torch.distributed.launch --nproc_per_node=4 --nnodes=1 train.py --config=configs/config-gated-spectnorm.yaml --distributed
+# CUDA_VISIBLE_DEVICES=0,1,2,3 python -m torch.distributed.launch --nproc_per_node=4 --nnodes=1 train.py --config=configs/config-gated-spectnorm-freeform.yaml --distributed
+
+# Distributed 1 Node, 8 GPU:
+# CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python -m torch.distributed.launch --nproc_per_node=8 --nnodes=1 train.py --config=configs/config-gated-spectnorm-freeform.yaml --distributed

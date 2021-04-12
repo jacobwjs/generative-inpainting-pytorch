@@ -3,6 +3,7 @@ import torch
 import yaml
 import numpy as np
 from PIL import Image
+import cv2
 
 import torch.nn.functional as F
 
@@ -179,6 +180,57 @@ def mask_image(x, bboxes, config):
         raise NotImplementedError('Not implemented mask type.')
 
     return result, mask
+
+
+def random_ff_mask(config, batch_size, to_tensor=True):
+    """Generate a random free form mask with configuration.
+
+    Args:
+        config: Config should have configuration including IMG_SHAPES,
+            VERTICAL_MARGIN, HEIGHT, HORIZONTAL_MARGIN, WIDTH.
+
+    Returns:
+        tuple: (top, left, height, width)
+    """
+
+    h,w = config['shape']
+#     mask = np.zeros((h,w))
+    num_v = 12+np.random.randint(config['mv'])#tf.random_uniform([], minval=0, maxval=config.MAXVERTEX, dtype=tf.int32)
+
+    masks = []
+    for i in range(batch_size):
+        mask = np.zeros((h,w))
+        for i in range(num_v):
+            start_x = np.random.randint(w)
+            start_y = np.random.randint(h)
+            for j in range(1+np.random.randint(5)):
+                angle = 0.01+np.random.randint(config['ma'])
+                if i % 2 == 0:
+                    angle = 2 * 3.1415926 - angle
+                length = 10+np.random.randint(config['ml'])
+                brush_w = 10+np.random.randint(config['mbw'])
+                end_x = (start_x + length * np.sin(angle)).astype(np.int32)
+                end_y = (start_y + length * np.cos(angle)).astype(np.int32)
+
+                cv2.line(mask, (start_y, start_x), (end_y, end_x), 1.0, brush_w)
+                start_x, start_y = end_x, end_y
+
+        mask = mask.reshape(mask.shape+(1,)).astype(np.float32).copy()
+
+        if to_tensor:
+            mask = torch.from_numpy(mask)
+            
+        masks.append(mask)
+        
+        
+    if to_tensor:
+#         mask = torch.from_numpy(mask)
+        masks = torch.cat(masks, dim=-1).permute(2,0,1).unsqueeze(1) # [HWN] -> [NCHW]
+        
+    return masks
+
+
+
 
 
 def spatial_discounting_mask(config):

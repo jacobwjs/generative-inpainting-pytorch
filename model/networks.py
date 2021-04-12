@@ -444,9 +444,95 @@ def test_contextual_attention(args):
     # flow = tensor_img_to_npimg(flow_t.cpu()[0])
     # cv2.imwrite('flow' + args.imageOut, flow_t)
 
+    
+
+class PatchDis(nn.Module):
+    '''
+    Spectral normalized patch discriminator
+    
+    Args:
+        config: configuration file
+        weight_norm: normalization type of the convolutional filters
+        use_cuda: boolean for GPU use (or not)
+        device: device id of GPU
+        
+    Returns:
+        patch based discrimination.
+    '''
+    def __init__(self,
+                 config,
+                 use_cuda=True,
+                 device=0):
+        
+        super(PatchDis, self).__init__()
+        self.input_dim = config['input_dim']
+        self.cnum = config['ndf']
+        self.weight_norm = config['weight_norm']
+
+        self.conv1 = dis_conv(
+            self.input_dim, self.cnum,
+            kernel_size=5, stride=2,
+            padding=0, rate=1,
+            activation='lrelu',
+            weight_norm=self.weight_norm
+        )
+        
+        self.conv2 = dis_conv(
+            self.cnum, self.cnum * 2,
+            kernel_size=5, stride=2,
+            padding=0, rate=1,
+            activation='lrelu',
+            weight_norm=self.weight_norm
+        )
+        
+        self.conv3 = dis_conv(
+            self.cnum * 2, self.cnum * 4,
+            kernel_size=5, stride=2,
+            padding=0, rate=1,
+            activation='lrelu',
+            weight_norm=self.weight_norm
+        )
+        
+        self.conv4 = dis_conv(
+            self.cnum * 4, self.cnum * 4,
+            kernel_size=5, stride=2,
+            padding=0, rate=1,
+            activation='lrelu',
+            weight_norm=self.weight_norm
+        )
+        
+        self.conv5 = dis_conv(
+            self.cnum * 4, self.cnum * 4,
+            kernel_size=5, stride=2,
+            padding=0, rate=1,
+            activation='lrelu',
+            weight_norm=self.weight_norm
+        )
+        
+        self.conv6 = dis_conv(
+            self.cnum * 4, self.cnum * 4,
+            kernel_size=5, stride=2,
+            padding=0, rate=1,
+            activation='lrelu',
+            weight_norm=self.weight_norm
+        )
+
+    def forward(self, x):
+        x = self.conv1(x)
+        x = self.conv2(x)
+        x = self.conv3(x)
+        x = self.conv4(x)
+        x = self.conv5(x)
+        x = self.conv6(x)
+        x = nn.Flatten()(x)
+        
+        return x
+    
+    
 
 class LocalDis(nn.Module):
-    def __init__(self, config,
+    def __init__(self,
+                 config,
                  use_cuda=True,
                  device_id=0):
         
@@ -520,6 +606,23 @@ class DisConvModule(nn.Module):
 
 def gen_conv(input_dim, output_dim, kernel_size=3, stride=1, padding=0, rate=1,
              activation='elu', gated=False):
+    """ 
+    Convolutions used in the generator.
+    
+    Args:
+        input_dim (int): number of input channels.
+        output_dim (int): number of output features.
+        kernel_size (int): kernel size of convolutional filters.
+        stride (int): convolutional stride.
+        padding (int): padding for convolution.
+        rate (int): dilation rate of dilated convolution.
+        activation (string): activation on computed features.
+        gated (bool): boolean deciding on making convolutions "gated".
+        
+    Return:
+        (tensor): result from convolution
+    """
+    
     if gated:
         conv2 = Conv2dBlockGated(input_dim, output_dim, kernel_size, stride,
                            conv_padding=padding, dilation=rate,
