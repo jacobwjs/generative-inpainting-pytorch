@@ -229,7 +229,6 @@ def train_distributed_v2(config, logger, writer, checkpoint_path):
     # DistributedDataParallel will use all available devices.
     #
     print("local_rank: ", local_rank)
-#     dist.barrier()
     torch.cuda.set_device(local_rank)
     print("Creating models on device: ", local_rank)
     
@@ -416,7 +415,6 @@ def train_distributed_v2(config, logger, writer, checkpoint_path):
         optimizer_g.step()
         
 
-#         print("ae_loss: ", ae_loss, " g_loss: ", g_loss, " d_loss: ", d_loss)
         # Set tqdm description
         #
         if local_rank == 0:
@@ -804,7 +802,6 @@ def train(config, logger, checkpoint_path):
             # Set tqdm description
             #
             log_losses = ['l1', 'ae', 'wgan_g', 'wgan_d', 'wgan_gp', 'g', 'd']  
-#             message = 'Iter: [%d/%d] ' % (iteration, config['niter'])
             message = ' '
             for k in log_losses:
                 v = losses.get(k, 0.)
@@ -832,7 +829,6 @@ def train(config, logger, checkpoint_path):
                     writer.add_scalar(k, v, iteration)
                     message += '%s: %.6f ' % (k, v)
                 message += speed_msg
-#                 logger.info(message)
                 
 
             if iteration % (config['viz_iter']) == 0:
@@ -915,7 +911,6 @@ def main():
     
     if args.distributed:
         print("Distributed training...")
-#         train_distributed(config, logger, writer, checkpoint_path)
         train_distributed_v2(config, logger, writer, checkpoint_path)
         
     else:
